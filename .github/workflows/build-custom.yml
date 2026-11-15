@@ -1,0 +1,471 @@
+name: Custom build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exporters:
+    name: Download pinned Minecraft and compile exporters
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out Horizon
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-11
+        with:
+          toolchain: stable
+
+      - name: Install Java 25 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Verify toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          java -version 2>&1 | grep -Eq 'version "25([.]|")'
+          javac -version 2>&1 | grep -Eq '^javac 25([.]|$)'
+
+      - name: Download and verify official Minecraft 26.3 files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/minecraft" <<'PY'
+          import hashlib
+          import json
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path, PurePosixPath
+
+          root = Path(sys.argv[1]).resolve()
+          lock = json.loads(
+              Path("research-lock.json").read_text(encoding="utf-8")
+          )["minecraft"]
+          version = lock["version"]
+
+          if version != "26.3":
+              raise SystemExit(f"Expected pinned Minecraft 26.3, found {version!r}")
+
+          # Restrict downloads and redirects to Mojang's official domains.
+          def check_official_url(url):
+              parsed = urllib.parse.urlparse(url)
+              host = (parsed.hostname or "").lower()
+              if (
+                  parsed.scheme != "https"
+                  or parsed.username
+                  or parsed.password
+                  or not host
+              ):
+                  raise SystemExit(f"Refusing malformed or non-HTTPS URL: {url!r}")
+
+              official_host = (
+                  host == "mojang.com"
+                  or host.endswith(".mojang.com")
+                  or host == "minecraft.net"
+                  or host.endswith(".minecraft.net")
+              )
+              if not official_host:
+                  raise SystemExit(f"Refusing URL outside Mojang domains: {url!r}")
+
+          class OfficialRedirectHandler(urllib.request.HTTPRedirectHandler):
+              def redirect_request(
+                  self, request, file_pointer, code, message, headers, new_url
+              ):
+                  check_official_url(new_url)
+                  return super().redirect_request(
+                      request, file_pointer, code, message, headers, new_url
+                  )
+
+          opener = urllib.request.build_opener(OfficialRedirectHandler)
+
+          def fetch(url):
+              check_official_url(url)
+              with opener.open(url, timeout=120) as response:
+                  check_official_url(response.geturl())
+                  return response.read()
+
+          def sha1(data):
+              return hashlib.sha1(data).hexdigest()
+
+          def safe_target(relative):
+              if (
+                  not isinstance(relative, str)
+                  or not relative
+                  or "\\" in relative
+                  or "\x00" in relative
+                  or re.match(r"^[A-Za-z]:", relative)
+              ):
+                  raise SystemExit(f"Unsafe download path: {relative!r}")
+
+              parts = relative.split("/")
+              path = PurePosixPath(relative)
+              if path.is_absolute() or any(
+                  part in ("", ".", "..") for part in parts
+              ):
+                  raise SystemExit(f"Unsafe download path: {relative!r}")
+
+              target = (root / Path(*path.parts)).resolve()
+              if not target.is_relative_to(root):
+                  raise SystemExit(
+                      f"Download path escapes destination: {relative!r}"
+                  )
+              return target
+
+          def download(url, relative, expected_sha1):
+              if not isinstance(expected_sha1, str) or not re.fullmatch(
+                  r"[0-9a-fA-F]{40}", expected_sha1
+              ):
+                  raise SystemExit(f"Missing or invalid SHA-1 for {relative!r}")
+
+              target = safe_target(relative)
+              data = fetch(url)
+              actual_sha1 = sha1(data)
+              if actual_sha1.lower() != expected_sha1.lower():
+                  raise SystemExit(
+                      f"SHA-1 mismatch for {relative}: got {actual_sha1}, "
+                      f"expected {expected_sha1}"
+                  )
+
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+              print(
+                  f"Verified {relative} ({len(data)} bytes; SHA-1 {actual_sha1})"
+              )
+
+          pinned_manifest_sha1 = lock["manifest_sha1"].lower()
+          manifest_url = (
+              "https://piston-meta.mojang.com/v1/packages/"
+              f"{pinned_manifest_sha1}/{version}.json"
+          )
+          manifest_bytes = fetch(manifest_url)
+          actual_manifest_sha1 = sha1(manifest_bytes)
+          accepted_manifest_hashes = {
+              pinned_manifest_sha1,
+              *(
+                  value.lower()
+                  for value in lock.get("accepted_manifest_sha1", [])
+              ),
+          }
+          if actual_manifest_sha1 not in accepted_manifest_hashes:
+              raise SystemExit(
+                  f"Manifest SHA-1 {actual_manifest_sha1} is not pinned or accepted"
+              )
+
+          manifest = json.loads(manifest_bytes)
+          if manifest.get("id") != version:
+              raise SystemExit(
+                  f"Manifest version is {manifest.get('id')!r}, "
+                  f"expected {version!r}"
+              )
+
+          downloads = manifest.get("downloads")
+          if not isinstance(downloads, dict):
+              raise SystemExit("Minecraft manifest has no downloads object")
+
+          versions_dir = root / "versions" / version
+          versions_dir.mkdir(parents=True, exist_ok=True)
+          (root / "libraries").mkdir(parents=True, exist_ok=True)
+          (root / "assets" / "indexes").mkdir(parents=True, exist_ok=True)
+          (root / "assets" / "objects").mkdir(parents=True, exist_ok=True)
+          (versions_dir / f"{version}.json").write_bytes(manifest_bytes)
+
+          for kind, filename, locked_sha1 in (
+              ("client", f"{version}.jar", lock["client_sha1"]),
+              ("server", f"{version}-server.jar", lock["server_sha1"]),
+          ):
+              entry = downloads.get(kind)
+              if not isinstance(entry, dict):
+                  raise SystemExit(f"Minecraft manifest has no downloads.{kind}")
+
+              url = entry.get("url")
+              declared_sha1 = entry.get("sha1")
+              if not url or not declared_sha1:
+                  raise SystemExit(
+                      f"Minecraft manifest downloads.{kind} lacks URL or SHA-1"
+                  )
+              if declared_sha1.lower() != locked_sha1.lower():
+                  raise SystemExit(
+                      f"Manifest {kind} SHA-1 {declared_sha1} differs from "
+                      f"research-lock.json {locked_sha1}"
+                  )
+
+              download(url, f"versions/{version}/{filename}", locked_sha1)
+
+          libraries = manifest.get("libraries")
+          if not isinstance(libraries, list):
+              raise SystemExit("Minecraft manifest has no libraries list")
+
+          downloaded = {}
+          for index, library in enumerate(libraries):
+              if not isinstance(library, dict):
+                  raise SystemExit(f"Invalid library entry #{index}")
+
+              artifact = library.get("downloads", {}).get("artifact")
+              if artifact is None:
+                  continue
+              if not isinstance(artifact, dict):
+                  raise SystemExit(f"Invalid library artifact at entry #{index}")
+
+              relative = artifact.get("path")
+              url = artifact.get("url")
+              expected_sha1 = artifact.get("sha1")
+              if not relative or not url or not expected_sha1:
+                  raise SystemExit(
+                      f"Library artifact #{index} lacks path, URL, or SHA-1"
+                  )
+
+              target = safe_target(f"libraries/{relative}")
+              signature = (url, expected_sha1.lower())
+              previous = downloaded.get(str(target))
+              if previous is not None:
+                  if previous != signature:
+                      raise SystemExit(
+                          f"Conflicting library artifacts target {relative!r}"
+                      )
+                  continue
+
+              downloaded[str(target)] = signature
+              download(url, f"libraries/{relative}", expected_sha1)
+
+          print(
+              f"Verified Minecraft {version}: pinned manifest, client and "
+              f"server jars, and {len(downloaded)} library artifacts."
+          )
+          PY
+
+      - name: Build horizon-prepare
+        shell: bash
+        run: cargo build --release --locked -p horizon-prepare
+
+      - name: Import official Minecraft files and compile exporters
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          target/release/horizon-prepare \
+            --prepare \
+            --root "$GITHUB_WORKSPACE" \
+            --minecraft-dir "$RUNNER_TEMP/minecraft" \
+            --server-jar "$RUNNER_TEMP/minecraft/versions/26.3/26.3-server.jar"
+
+          bundle=$(
+            target/release/horizon-prepare compile-exporters \
+              --root "$GITHUB_WORKSPACE" | tail -1
+          )
+
+          test -d "$bundle/server"
+          test -d "$bundle/client"
+          test -f "$bundle/manifest.json"
+
+          mkdir -p exporters
+          cp -R "$bundle/server" "$bundle/client" "$bundle/manifest.json" exporters/
+
+          stray=$(
+            find exporters -type f ! -path exporters/manifest.json \
+              ! \( -name '*.class' \
+                \( -path 'exporters/server/dev/horizonlab/parity/*' \
+                   -o -path 'exporters/client/dev/horizonlab/parity/*' \) \)
+          )
+          if [ -n "$stray" ]; then
+            echo "::error::Unexpected exporter files: $stray"
+            exit 1
+          fi
+
+          python3 tools/check_prepare_exporters.py \
+            --binary target/release/horizon-prepare
+
+      - name: Upload original-exporters
+        uses: actions/upload-artifact@v7
+        with:
+          name: original-exporters
+          path: |
+            exporters/server/
+            exporters/client/
+            exporters/manifest.json
+          if-no-files-found: error
+          retention-days: 3
+
+  windows-x64:
+    name: Build and package Windows x64
+    runs-on: windows-latest
+    needs: exporters
+    timeout-minutes: 40
+    env:
+      HORIZON_VERSION: custom-${{ github.run_number }}
+      HORIZON_NIGHTLY: ''
+      RUSTFLAGS: -C target-feature=+crt-static
+      BIN: target/release
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out Horizon
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+          clean: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-11
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: custom-windows-x64
+
+      - name: Download original exporters
+        uses: actions/download-artifact@v8
+        with:
+          name: original-exporters
+          path: exporters
+
+      - name: Verify exporter artifact layout
+        run: |
+          set -euo pipefail
+          test -d exporters/client
+          test -d exporters/server
+          test -f exporters/manifest.json
+
+      - name: Build the official game, horizon-ctl, horizon-prepare and horizon-server
+        run: >
+          cargo build --release --locked
+          -p horizon-official --bin horizon-official
+          -p horizon-client-lib --bin horizon-ctl
+          -p horizon-prepare --bin horizon-prepare
+          -p horizon-server --bin horizon-server
+
+      - name: The official game is the game players get, under its name
+        run: cp -f "$BIN/horizon-official.exe" "$BIN/horizon-client.exe"
+
+      - name: Every program the release folder takes was built
+        run: |
+          set -euo pipefail
+          for binary in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            test -f "$BIN/$binary.exe" || {
+              echo "::error::$BIN/$binary.exe is missing"
+              exit 1
+            }
+          done
+
+      - name: Verify Windows executable architecture
+        run: |
+          python tools/check_pe_arch.py x64 \
+            "$BIN/horizon-client.exe" \
+            "$BIN/horizon-ctl.exe" \
+            "$BIN/horizon-prepare.exe" \
+            "$BIN/horizon-server.exe"
+
+      - name: Only system libraries
+        run: |
+          set -euo pipefail
+          for binary in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            python tools/check_imports.py "$BIN/$binary.exe"
+          done
+
+      - name: Baseline x86-64 CPUs only
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools
+          python tools/check_cpu_baseline.py \
+            "$BIN/horizon-client.exe" \
+            "$BIN/horizon-ctl.exe" \
+            "$BIN/horizon-prepare.exe" \
+            "$BIN/horizon-server.exe"
+
+      - name: Every program starts
+        run: |
+          set -euo pipefail
+          "$BIN/horizon-client.exe" --help | grep -q -- '--resources'
+          "$BIN/horizon-ctl.exe" --help > /dev/null
+          "$BIN/horizon-prepare.exe" --help | grep -q -- '--minecraft-dir'
+
+          for binary in horizon-prepare horizon-server; do
+            out=$("$BIN/$binary.exe" --version | tr -d '\r')
+            echo "$out"
+            [[ "$out" == "$binary $HORIZON_VERSION" ]] || {
+              echo "::error::expected $binary $HORIZON_VERSION"
+              exit 1
+            }
+          done
+
+      - name: Package the graphical Windows x64 game
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- package \
+            "$BIN/horizon-client.exe" \
+            "dist/horizon-windows-x64"
+
+          python tools/ci/fetch_dxc.py "dist/horizon-windows-x64"
+
+          cd dist
+          rm -f horizon-windows-x64.zip
+          7z a -tzip horizon-windows-x64.zip horizon-windows-x64/ > /dev/null
+          ls -l horizon-windows-x64.zip
+
+      - name: Verify package contents
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          archive = Path("dist/horizon-windows-x64.zip")
+          expected = {
+              "horizon-windows-x64/horizon-client.exe",
+              "horizon-windows-x64/horizon-ctl.exe",
+              "horizon-windows-x64/horizon-prepare.exe",
+              "horizon-windows-x64/horizon-server.exe",
+              "horizon-windows-x64/PLAY.txt",
+              "horizon-windows-x64/exporters/client/",
+              "horizon-windows-x64/exporters/server/",
+              "horizon-windows-x64/exporters/manifest.json",
+              "horizon-windows-x64/dxcompiler.dll",
+              "horizon-windows-x64/DXC-LICENSE-MS.txt",
+              "horizon-windows-x64/DXC-LICENSE-LLVM.txt",
+              "horizon-windows-x64/DXC-NOTICE.txt",
+          }
+
+          with zipfile.ZipFile(archive) as package:
+              names = set(package.namelist())
+              missing = sorted(expected - names)
+              if missing:
+                  raise SystemExit(f"Package is missing expected entries: {missing}")
+
+              for name in (
+                  "horizon-windows-x64/horizon-client.exe",
+                  "horizon-windows-x64/exporters/manifest.json",
+                  "horizon-windows-x64/dxcompiler.dll",
+              ):
+                  if name not in names:
+                      raise SystemExit(f"Required package file is missing: {name}")
+
+          print(f"Verified package layout: {archive}")
+          PY
+
+      - name: Upload horizon-windows-x64.zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: horizon-windows-x64.zip
+          path: dist/horizon-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 3
